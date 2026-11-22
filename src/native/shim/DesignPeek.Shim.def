@@ -1,0 +1,4 @@
+LIBRARY "DesignPeek.Shim"
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

@@ -1,0 +1,61 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Version
+        id: version
+        run: |
+          $v = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { "0.1.0-dev.$env:GITHUB_RUN_NUMBER" }
+          "value=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Version $v"
+
+      - name: Build native shim (C++)
+        run: |
+          cmake -S src/native -B build/native -A x64
+          cmake --build build/native --config Release
+
+      - name: Publish worker (.NET)
+        run: dotnet publish src/DesignPeek.Worker/DesignPeek.Worker.csproj -c Release -o artifacts/app
+
+      - name: Assemble app folder
+        run: Copy-Item build/native/Release/DesignPeek.Shim.dll artifacts/app/
+
+      - name: Parser tests (also creates sample files)
+        run: dotnet run --project tests/DesignPeek.Tests/DesignPeek.Tests.csproj -c Release -- "$env:RUNNER_TEMP\samples"
+
+      - name: Shim end-to-end tests
+        run: ./tests/run-shim-tests.ps1 -ShimTest build/native/Release/DesignPeek.ShimTest.exe -Shim artifacts/app/DesignPeek.Shim.dll -Samples "$env:RUNNER_TEMP\samples"
+
+      - name: Build installer (Inno Setup)
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=${{ steps.version.outputs.value }}" "/DAppSourceDir=$env:GITHUB_WORKSPACE\artifacts\app" installer/DesignPeek.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DesignPeek-Setup-${{ steps.version.outputs.value }}
+          path: installer/Output/*.exe
+          if-no-files-found: error

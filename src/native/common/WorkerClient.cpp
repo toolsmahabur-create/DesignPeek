@@ -1,16 +1,15 @@
-#include "WorkerHost.h"
+#include "WorkerClient.h"
 
 #include <cstring>
 #include <memory>
-#include <string>
 
-#include "Module.h"
+#include "Protocol.h"
 
+namespace dp
+{
 namespace
 {
-constexpr wchar_t kWorkerExe[] = L"DesignPeek.Worker.exe";
 constexpr DWORD kPipeBufferSize = 1 << 20;
-constexpr INT32 kMaxReadRequest = 8 * 1024 * 1024;
 constexpr SIZE_T kWorkerMemoryLimit = 300ull * 1024 * 1024;
 constexpr DWORD kExitGraceMs = 1000;
 
@@ -45,7 +44,7 @@ bool ReadExact(HANDLE pipe, void* buffer, size_t size)
     auto* cursor = static_cast<BYTE*>(buffer);
     while (size > 0)
     {
-        const DWORD chunk = static_cast<DWORD>(size > MAXDWORD ? MAXDWORD : size);
+        const DWORD chunk = static_cast<DWORD>(size > (1u << 30) ? (1u << 30) : size);
         DWORD read = 0;
         if (!ReadFile(pipe, cursor, chunk, &read, nullptr) || read == 0)
         {
@@ -62,7 +61,7 @@ bool WriteExact(HANDLE pipe, const void* buffer, size_t size)
     const auto* cursor = static_cast<const BYTE*>(buffer);
     while (size > 0)
     {
-        const DWORD chunk = static_cast<DWORD>(size > MAXDWORD ? MAXDWORD : size);
+        const DWORD chunk = static_cast<DWORD>(size > (1u << 30) ? (1u << 30) : size);
         DWORD written = 0;
         if (!WriteFile(pipe, cursor, chunk, &written, nullptr) || written == 0)
         {
@@ -74,33 +73,6 @@ bool WriteExact(HANDLE pipe, const void* buffer, size_t size)
     return true;
 }
 
-std::wstring GetWorkerPath()
-{
-    std::wstring path(MAX_PATH, L'\0');
-    for (;;)
-    {
-        const DWORD length = GetModuleFileNameW(g_hModule, path.data(), static_cast<DWORD>(path.size()));
-        if (length == 0)
-        {
-            return {};
-        }
-        if (length < path.size())
-        {
-            path.resize(length);
-            break;
-        }
-        path.resize(path.size() * 2);
-    }
-    const size_t slash = path.find_last_of(L"\\/");
-    if (slash == std::wstring::npos)
-    {
-        return {};
-    }
-    path.resize(slash + 1);
-    path += kWorkerExe;
-    return path;
-}
-
 UniqueHandle CreateWorkerJob()
 {
     UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
@@ -109,8 +81,7 @@ UniqueHandle CreateWorkerJob()
         return nullptr;
     }
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
-                                              JOB_OBJECT_LIMIT_PROCESS_MEMORY |
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_PROCESS_MEMORY |
                                               JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION |
                                               JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
     limits.BasicLimitInformation.ActiveProcessLimit = 1;
@@ -119,20 +90,14 @@ UniqueHandle CreateWorkerJob()
     return job;
 }
 
-HRESULT StartWorker(const std::wstring& arguments, WorkerProcess& worker)
+HRESULT StartWorker(const WorkerRequest& request, WorkerProcess& worker)
 {
-    const std::wstring exe = GetWorkerPath();
-    if (exe.empty())
-    {
-        return E_FAIL;
-    }
-    if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES)
+    if (request.workerPath.empty() || GetFileAttributesW(request.workerPath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
         return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
     }
 
     SECURITY_ATTRIBUTES inheritable{sizeof(inheritable), nullptr, TRUE};
-
     HANDLE childIn = nullptr;
     HANDLE parentOut = nullptr;
     if (!CreatePipe(&childIn, &parentOut, &inheritable, kPipeBufferSize))
@@ -151,11 +116,11 @@ HRESULT StartWorker(const std::wstring& arguments, WorkerProcess& worker)
     UniqueHandle parentInHandle(parentIn);
     UniqueHandle childOutHandle(childOut);
 
-    // Our own ends must not leak into the child, or broken-pipe detection stops working.
+    // Our own ends must not leak into the child, or a dead worker would not show up as a broken pipe.
     SetHandleInformation(parentOut, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(parentIn, HANDLE_FLAG_INHERIT, 0);
 
-    // Inherit exactly these two handles, nothing else from the host process.
+    // Inherit exactly these two handles and nothing else from the host process.
     SIZE_T attributeSize = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
     auto attributeBuffer = std::make_unique<BYTE[]>(attributeSize);
@@ -181,11 +146,11 @@ HRESULT StartWorker(const std::wstring& arguments, WorkerProcess& worker)
     startup.StartupInfo.hStdError = nullptr;
     startup.lpAttributeList = attributes;
 
-    std::wstring commandLine = L"\"" + exe + L"\" " + arguments;
+    std::wstring commandLine = L"\"" + request.workerPath + L"\" " + request.arguments;
     PROCESS_INFORMATION info{};
     const DWORD flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
-    const BOOL created = CreateProcessW(exe.c_str(), commandLine.data(), nullptr, nullptr, TRUE, flags, nullptr,
-                                        nullptr, &startup.StartupInfo, &info);
+    const BOOL created = CreateProcessW(request.workerPath.c_str(), commandLine.data(), nullptr, nullptr, TRUE, flags,
+                                        nullptr, nullptr, &startup.StartupInfo, &info);
     const HRESULT createHr = created ? S_OK : LastErrorHr();
     DeleteProcThreadAttributeList(attributes);
     if (!created)
@@ -195,114 +160,102 @@ HRESULT StartWorker(const std::wstring& arguments, WorkerProcess& worker)
 
     UniqueHandle thread(info.hThread);
     worker.process.reset(info.hProcess);
-
-    // If the host already runs inside a job that forbids nesting, we still have the timeout.
     worker.job = CreateWorkerJob();
     if (worker.job && !AssignProcessToJobObject(worker.job.get(), info.hProcess))
     {
-        worker.job.reset();
+        worker.job.reset(); // host job forbids nesting: the timeout still protects us
     }
-
     ResumeThread(info.hThread);
     worker.toWorker = std::move(parentOutHandle);
     worker.fromWorker = std::move(parentInHandle);
-    return S_OK; // child-side pipe ends close here, so a dead worker shows up as a broken pipe
+    return S_OK; // child-side pipe ends close here
 }
 
-INT32 ReadFromStream(IStream* stream, INT64 offset, BYTE* destination, INT32 count)
-{
-    LARGE_INTEGER position{};
-    position.QuadPart = offset;
-    if (FAILED(stream->Seek(position, STREAM_SEEK_SET, nullptr)))
-    {
-        return -1;
-    }
-    INT32 total = 0;
-    while (total < count)
-    {
-        ULONG read = 0;
-        const HRESULT hr = stream->Read(destination + total, static_cast<ULONG>(count - total), &read);
-        if (FAILED(hr))
-        {
-            return total > 0 ? total : -1;
-        }
-        total += static_cast<INT32>(read);
-        if (hr == S_FALSE || read == 0)
-        {
-            break;
-        }
-    }
-    return total;
-}
-
-HRESULT ServeWorker(IStream* stream, UINT cx, WorkerProcess& worker, WorkerBitmap& result)
+HRESULT Serve(const WorkerRequest& request, WorkerProcess& worker, WorkerResponse& response)
 {
     HANDLE in = worker.fromWorker.get();
     HANDLE out = worker.toWorker.get();
-    std::unique_ptr<BYTE[]> buffer;
-    INT32 bufferSize = 0;
+    std::unique_ptr<uint8_t[]> buffer;
+    int32_t bufferSize = 0;
 
     for (;;)
     {
-        BYTE op = 0;
+        uint8_t op = 0;
         if (!ReadExact(in, &op, 1))
         {
-            return HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE); // crashed, killed by timeout, or out of memory
+            return HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE); // crashed, out of memory, or killed by timeout
         }
-
         switch (op)
         {
-        case 'R':
+        case protocol::kRead:
         {
-            BYTE header[12];
+            uint8_t header[12];
             if (!ReadExact(in, header, sizeof(header)))
             {
                 return E_FAIL;
             }
-            INT64 offset = 0;
-            INT32 count = 0;
-            std::memcpy(&offset, header, sizeof(offset));
-            std::memcpy(&count, header + 8, sizeof(count));
-            if (offset < 0 || count < 0 || count > kMaxReadRequest)
+            int64_t offset = 0;
+            int32_t count = 0;
+            std::memcpy(&offset, header, 8);
+            std::memcpy(&count, header + 8, 4);
+            if (offset < 0 || count < 0 || count > protocol::kMaxReadRequest)
             {
                 return E_FAIL;
             }
             if (count > bufferSize)
             {
-                buffer = std::make_unique<BYTE[]>(count);
+                buffer = std::make_unique<uint8_t[]>(size_t(count));
                 bufferSize = count;
             }
-            const INT32 got = count == 0 ? 0 : ReadFromStream(stream, offset, buffer.get(), count);
-            if (!WriteExact(out, &got, sizeof(got)) || (got > 0 && !WriteExact(out, buffer.get(), got)))
+            int32_t got = count == 0 ? 0 : request.read(offset, buffer.get(), count);
+            if (got > count)
+            {
+                got = -1;
+            }
+            if (!WriteExact(out, &got, sizeof(got)) || (got > 0 && !WriteExact(out, buffer.get(), size_t(got))))
             {
                 return E_FAIL;
             }
             break;
         }
-        case 'B':
+        case protocol::kInfo:
         {
-            INT32 header[3] = {};
+            int32_t length = 0;
+            if (!ReadExact(in, &length, 4) || length < 0 || length > protocol::kMaxInfoBytes)
+            {
+                return E_FAIL;
+            }
+            response.info.resize(size_t(length));
+            if (length > 0 && !ReadExact(in, response.info.data(), size_t(length)))
+            {
+                return E_FAIL;
+            }
+            break;
+        }
+        case protocol::kBitmap:
+        {
+            int32_t header[3] = {};
             if (!ReadExact(in, header, sizeof(header)))
             {
                 return E_FAIL;
             }
-            const INT32 width = header[0];
-            const INT32 height = header[1];
-            if (width <= 0 || height <= 0 || static_cast<UINT>(width) > cx || static_cast<UINT>(height) > cx)
+            const int32_t width = header[0];
+            const int32_t height = header[1];
+            if (width <= 0 || height <= 0 || width > request.maxDimension || height > request.maxDimension)
             {
                 return E_FAIL;
             }
-            result.width = width;
-            result.height = height;
-            result.hasAlpha = header[2] != 0;
-            result.pixels.resize(static_cast<size_t>(width) * height * 4);
-            return ReadExact(in, result.pixels.data(), result.pixels.size()) ? S_OK : E_FAIL;
+            response.width = width;
+            response.height = height;
+            response.hasAlpha = header[2] != 0;
+            response.pixels.resize(size_t(width) * size_t(height) * 4);
+            return ReadExact(in, response.pixels.data(), response.pixels.size()) ? S_OK : E_FAIL;
         }
-        case 'E':
+        case protocol::kError:
         {
-            INT32 code = 0;
+            int32_t code = 0;
             ReadExact(in, &code, sizeof(code));
-            return E_FAIL;
+            return response.info.empty() ? E_FAIL : S_FALSE;
         }
         default:
             return E_FAIL;
@@ -316,41 +269,30 @@ VOID CALLBACK OnWorkerTimeout(PVOID process, BOOLEAN)
 }
 } // namespace
 
-HRESULT RunThumbnailWorker(IStream* stream, UINT cx, DWORD timeoutMs, WorkerBitmap& result)
+HRESULT RunWorker(const WorkerRequest& request, WorkerResponse& response)
 {
-    STATSTG stat{};
-    HRESULT hr = stream->Stat(&stat, STATFLAG_NONAME);
-    if (FAILED(hr))
+    if (!request.read)
     {
-        return hr;
+        return E_INVALIDARG;
     }
-    const ULONGLONG length = stat.cbSize.QuadPart;
-    if (length < 4)
-    {
-        return E_FAIL; // zero-byte / empty file: keep the normal icon
-    }
-
-    const std::wstring arguments =
-        L"thumb --size " + std::to_wstring(cx) + L" --length " + std::to_wstring(length);
-
     WorkerProcess worker;
-    hr = StartWorker(arguments, worker);
+    HRESULT hr = StartWorker(request, worker);
     if (FAILED(hr))
     {
         return hr;
     }
 
     HANDLE timer = nullptr;
-    if (!CreateTimerQueueTimer(&timer, nullptr, OnWorkerTimeout, worker.process.get(), timeoutMs, 0,
+    if (!CreateTimerQueueTimer(&timer, nullptr, OnWorkerTimeout, worker.process.get(), request.timeoutMs, 0,
                                WT_EXECUTEONLYONCE))
     {
         TerminateProcess(worker.process.get(), 1);
         return LastErrorHr();
     }
 
-    hr = ServeWorker(stream, cx, worker, result);
+    hr = Serve(request, worker, response);
 
-    // INVALID_HANDLE_VALUE: wait for a running callback to finish before the process handle closes.
+    // INVALID_HANDLE_VALUE: wait for a running callback before the process handle is closed.
     DeleteTimerQueueTimer(nullptr, timer, INVALID_HANDLE_VALUE);
     if (WaitForSingleObject(worker.process.get(), kExitGraceMs) != WAIT_OBJECT_0)
     {
@@ -358,3 +300,31 @@ HRESULT RunThumbnailWorker(IStream* stream, UINT cx, DWORD timeoutMs, WorkerBitm
     }
     return hr;
 }
+
+std::wstring SiblingPath(HMODULE module, const wchar_t* fileName)
+{
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;)
+    {
+        const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0)
+        {
+            return {};
+        }
+        if (length < path.size())
+        {
+            path.resize(length);
+            break;
+        }
+        path.resize(path.size() * 2);
+    }
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+    {
+        return {};
+    }
+    path.resize(slash + 1);
+    path += fileName;
+    return path;
+}
+} // namespace dp

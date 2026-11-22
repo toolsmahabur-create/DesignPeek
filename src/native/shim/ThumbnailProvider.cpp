@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "../common/WorkerClient.h"
 #include "Module.h"
-#include "WorkerHost.h"
 
 namespace
 {
@@ -12,7 +12,33 @@ constexpr DWORD kThumbnailTimeoutMs = 3000;
 constexpr UINT kMinSize = 16;
 constexpr UINT kMaxSize = 2560;
 
-HBITMAP CreateBitmapFromPixels(const WorkerBitmap& image)
+int32_t ReadFromStream(IStream* stream, int64_t offset, uint8_t* destination, int32_t count)
+{
+    LARGE_INTEGER position{};
+    position.QuadPart = offset;
+    if (FAILED(stream->Seek(position, STREAM_SEEK_SET, nullptr)))
+    {
+        return -1;
+    }
+    int32_t total = 0;
+    while (total < count)
+    {
+        ULONG read = 0;
+        const HRESULT hr = stream->Read(destination + total, static_cast<ULONG>(count - total), &read);
+        if (FAILED(hr))
+        {
+            return total > 0 ? total : -1;
+        }
+        total += static_cast<int32_t>(read);
+        if (hr == S_FALSE || read == 0)
+        {
+            break;
+        }
+    }
+    return total;
+}
+
+HBITMAP CreateBitmapFromPixels(const dp::WorkerResponse& image)
 {
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -106,13 +132,35 @@ IFACEMETHODIMP ThumbnailProvider::GetThumbnail(UINT cx, HBITMAP* bitmap, WTS_ALP
         return E_UNEXPECTED;
     }
 
-    cx = std::clamp(cx, kMinSize, kMaxSize);
-
-    WorkerBitmap image;
-    const HRESULT hr = RunThumbnailWorker(m_stream, cx, kThumbnailTimeoutMs, image);
+    STATSTG stat{};
+    HRESULT hr = m_stream->Stat(&stat, STATFLAG_NONAME);
     if (FAILED(hr))
     {
-        return hr; // Explorer keeps showing the normal file icon.
+        return hr;
+    }
+    if (stat.cbSize.QuadPart < 4)
+    {
+        return E_FAIL; // zero-byte file: keep the normal icon
+    }
+
+    cx = std::clamp(cx, kMinSize, kMaxSize);
+    IStream* stream = m_stream;
+
+    dp::WorkerRequest request;
+    request.workerPath = dp::SiblingPath(g_hModule, L"DesignPeek.Worker.exe");
+    request.arguments = L"thumb --size " + std::to_wstring(cx) + L" --length " + std::to_wstring(stat.cbSize.QuadPart);
+    request.length = stat.cbSize.QuadPart;
+    request.timeoutMs = kThumbnailTimeoutMs;
+    request.maxDimension = static_cast<int>(cx);
+    request.read = [stream](int64_t offset, uint8_t* destination, int32_t count) {
+        return ReadFromStream(stream, offset, destination, count);
+    };
+
+    dp::WorkerResponse image;
+    hr = dp::RunWorker(request, image);
+    if (hr != S_OK)
+    {
+        return FAILED(hr) ? hr : E_FAIL; // Explorer keeps showing the normal file icon
     }
 
     HBITMAP result = CreateBitmapFromPixels(image);

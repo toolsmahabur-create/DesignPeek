@@ -7,12 +7,11 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   build:
     runs-on: windows-2022
+    permissions:
+      contents: write # only used to publish a release when a v* tag is pushed
     defaults:
       run:
         shell: pwsh
@@ -21,30 +20,32 @@ jobs:
 
       - uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: '10.0.x' # test runner only; the app itself is pure C++
 
       - name: Version
         id: version
         run: |
-          $v = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { "0.1.0-dev.$env:GITHUB_RUN_NUMBER" }
+          $v = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { "0.2.0-dev.$env:GITHUB_RUN_NUMBER" }
           "value=$v" >> $env:GITHUB_OUTPUT
           Write-Host "Version $v"
 
-      - name: Build native shim (C++)
+      - name: Build (C++)
         run: |
           cmake -S src/native -B build/native -A x64
           cmake --build build/native --config Release
 
-      - name: Publish worker (.NET)
-        run: dotnet publish src/DesignPeek.Worker/DesignPeek.Worker.csproj -c Release -o artifacts/app
-
       - name: Assemble app folder
-        run: Copy-Item build/native/Release/DesignPeek.Shim.dll artifacts/app/
+        run: |
+          New-Item -ItemType Directory -Force artifacts/app | Out-Null
+          foreach ($f in 'DesignPeek.exe', 'DesignPeek.Worker.exe', 'DesignPeek.Shim.dll') {
+            Copy-Item "build/native/Release/$f" artifacts/app/
+          }
+          Get-ChildItem artifacts/app | Format-Table Name, @{n='KB';e={[math]::Round($_.Length/1KB)}}
 
-      - name: Parser tests (also creates sample files)
-        run: dotnet run --project tests/DesignPeek.Tests/DesignPeek.Tests.csproj -c Release -- "$env:RUNNER_TEMP\samples"
+      - name: Worker + app tests
+        run: dotnet run --project tests/DesignPeek.Tests/DesignPeek.Tests.csproj -c Release -- artifacts/app "$env:RUNNER_TEMP\samples"
 
-      - name: Shim end-to-end tests
+      - name: Explorer thumbnail (shim) tests
         run: ./tests/run-shim-tests.ps1 -ShimTest build/native/Release/DesignPeek.ShimTest.exe -Shim artifacts/app/DesignPeek.Shim.dll -Samples "$env:RUNNER_TEMP\samples"
 
       - name: Build installer (Inno Setup)
@@ -53,9 +54,16 @@ jobs:
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
           & $iscc "/DAppVersion=${{ steps.version.outputs.value }}" "/DAppSourceDir=$env:GITHUB_WORKSPACE\artifacts\app" installer/DesignPeek.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem installer/Output | Format-Table Name, @{n='KB';e={[math]::Round($_.Length/1KB)}}
 
       - uses: actions/upload-artifact@v5
         with:
           name: DesignPeek-Setup-${{ steps.version.outputs.value }}
-          path: installer/Output/*.exe
+          path: installer/Output/DesignPeek-Setup.exe
           if-no-files-found: error
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME installer/Output/DesignPeek-Setup.exe --title "DesignPeek $env:GITHUB_REF_NAME" --generate-notes

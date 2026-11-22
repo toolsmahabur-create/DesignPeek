@@ -15,7 +15,10 @@ $cases = @(
     @{ Path = 'psb_with_thumb.psb'; Size = 256; Expect = 'ok' }
     @{ Path = 'psd_bgr_1033.psd';   Size = 256; Expect = 'ok' }
     @{ Path = 'large.psb';          Size = 256; Expect = 'ok' }
-    @{ Path = 'psd_no_thumb.psd';   Size = 256; Expect = 'fail' }
+    @{ Path = 'psd_no_thumb.psd';   Size = 256; Expect = 'ok' }
+    @{ Path = 'psd_rle.psd';        Size = 256; Expect = 'ok' }
+    @{ Path = 'psd_cmyk.psd';       Size = 256; Expect = 'ok' }
+    @{ Path = 'psd_layers.psd';     Size = 96;  Expect = 'ok' }
     @{ Path = 'zero.psd';           Size = 256; Expect = 'fail' }
     @{ Path = 'corrupt.psd';        Size = 256; Expect = 'fail' }
     @{ Path = 'truncated.psd';      Size = 256; Expect = 'fail' }

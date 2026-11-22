@@ -104,7 +104,7 @@ var
 begin
   Shim := ExpandConstant('{app}\DesignPeek.Shim.dll');
   if FileExists(Shim) and (not DeleteFile(Shim)) then
-    RenameFile(Shim, AddBackslash(TargetFolder) + 'DesignPeek.Shim.old.' + IntToStr(GetTickCount) + '.dll');
+    RenameFile(Shim, AddBackslash(TargetFolder) + 'DesignPeek.Shim.old.' + GetDateTimeString('yyyymmddhhnnsszzz', #0, #0) + '.dll');
 
   if FindFirst(ExpandConstant('{app}\DesignPeek.Shim.old.*'), FindRec) then
   try
